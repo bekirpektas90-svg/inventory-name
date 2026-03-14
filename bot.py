@@ -99,8 +99,8 @@ def create_excel(products_data):
         "Social Media Link Description", "Price", "Online Sale Price", "Archived",
         "Sellable", "Contains Alcohol", "Stockable", "Skip Detail Screen in POS",
         "Option Name 1", "Option Value 1", "Default Unit Cost", "Default Vendor Name",
-        "Default Vendor Code", "Current Quantity", "New Quantity",
-        "Stock Alert Enabled", "Stock Alert Count"
+        "Default Vendor Code", "Current Quantity GAVA NEW YORK", "New Quantity GAVA NEW YORK",
+        "Stock Alert Enabled GAVA NEW YORK", "Stock Alert Count GAVA NEW YORK"
     ]
 
     # Style header row
@@ -151,10 +151,10 @@ def create_excel(products_data):
                     "Default Unit Cost": p["cost"],
                     "Default Vendor Name": p["vendor"],
                     "Default Vendor Code": None,
-                    "Current Quantity": qty_per_size,
-                    "New Quantity": qty_per_size,
-                    "Stock Alert Enabled": None,
-                    "Stock Alert Count": None,
+                    "Current Quantity GAVA NEW YORK": qty_per_size,
+                    "New Quantity GAVA NEW YORK": qty_per_size,
+                    "Stock Alert Enabled GAVA NEW YORK": None,
+                    "Stock Alert Count GAVA NEW YORK": None,
                 }
                 rows.append(row)
 
