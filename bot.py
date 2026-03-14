@@ -15,51 +15,125 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+STORAGE_CHANNEL_ID = -1001003837623060
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-INVOICE_PROMPT = """You are an invoice parser. Extract all product lines from this invoice image or PDF.
+INVOICE_PROMPT = """You are an invoice parser. Extract all product lines from this invoice.
 
-For each product line, extract:
-- SKU/Model number (the number at the beginning)
-- Product name
-- Quantity (Qty column)
-- Unit cost (Rate/Price column)
+For each product line extract:
+- SKU/Model number
+- Product name  
+- Quantity (total units or packs)
+- Unit cost (Rate/Price per unit)
 
 Respond ONLY with a JSON array, no other text:
 [
   {"sku": "1308", "name": "Dress Embroidery", "qty": 12, "cost": 8.00},
   {"sku": "3701", "name": "Mini Dress", "qty": 12, "cost": 5.75}
 ]
-
-If you cannot read the invoice clearly, respond with: {"error": "Cannot read invoice"}
 """
 
-CATALOG_SYSTEM_PROMPT = """You are a Square POS catalog assistant. 
-The user will provide color and size information for products.
-Parse the input and respond ONLY with JSON in this exact format:
+COLOR_PARSE_PROMPT = """Parse color, size and quantity info from natural language.
+Respond ONLY with JSON:
 {
   "colors": {"BLACK": {"code": "BLK", "packs": 3}, "WHITE": {"code": "WHT", "packs": 3}},
   "sizes": ["S", "M", "L"],
   "units_per_size": 2
 }
 
-Color codes: BLACK=BLK, WHITE=WHT, BLUE=BLU, BEIGE=BGE, PINK=PNK, RED=RED, GREEN=GRN, GREY=GRY, BROWN=BRN, ORANGE=ORG, PURPLE=PRP
+Examples:
+"3 siyah 3 beyaz 2S2M2L" → BLACK=3, WHITE=3, sizes=[S,M,L], units=2
+"4 black 4 red 4 blue 2S2M2L" → BLACK=4, RED=4, BLUE=4, sizes=[S,M,L], units=2
+"3siyah 3kirmizi 3mavi 2S2M2L" → BLACK=3, RED=3, BLUE=3, sizes=[S,M,L], units=2
 
-Parse natural language like:
-- "2S 2M 2L | 3 Black 3 White" 
-- "3 siyah 3 beyaz 2S 2M 2L"
-- "black white beige hepsi 4er 2S2M2L"
-
-Respond ONLY with the JSON object, no other text.
+Color codes: BLACK/siyah=BLK, WHITE/beyaz=WHT, BLUE/mavi=BLU, BEIGE/bej=BGE,
+PINK/pembe=PNK, RED/kirmizi=RED, GREEN/yesil=GRN, GREY/gri=GRY, BROWN/kahve=BRN,
+ORANGE/turuncu=ORG, PURPLE/mor=PRP
 """
 
-# User session states
-user_sessions = {}
-# States: idle, collecting_products, asking_colors, asking_price, done
+# In-memory session (resets on restart, but invoice data is in Telegram channel)
+user_session = {"state": "idle", "active_invoice": None, "active_msg_id": None, "current_sku": None}
 
 
-def create_excel(products):
+# ── TELEGRAM STORAGE ──────────────────────────────────────
+
+async def storage_save(app, invoice_name, data):
+    """Save invoice data as a message in storage channel"""
+    invoices = await storage_load_all(app)
+    invoices[invoice_name] = data
+    # Delete old message if exists
+    for name, inv in invoices.items():
+        if inv.get("msg_id") and name == invoice_name:
+            try:
+                await app.bot.delete_message(STORAGE_CHANNEL_ID, inv["msg_id"])
+            except:
+                pass
+    # Post new message
+    text = f"INVOICE_DATA\n{json.dumps(invoices, ensure_ascii=False)}"
+    msg = await app.bot.send_message(STORAGE_CHANNEL_ID, text)
+    # Delete old master message
+    old_msgs = await storage_find_master(app)
+    for old_id in old_msgs[:-1]:
+        try:
+            await app.bot.delete_message(STORAGE_CHANNEL_ID, old_id)
+        except:
+            pass
+    return msg.message_id
+
+
+async def storage_find_master(app):
+    """Find all INVOICE_DATA messages"""
+    msg_ids = []
+    try:
+        updates = await app.bot.get_updates(limit=100)
+    except:
+        pass
+    return msg_ids
+
+
+async def storage_load_all(app):
+    """Load all invoices from channel"""
+    try:
+        # Use channel message history via forwarding trick
+        # We store everything in one pinned message
+        chat = await app.bot.get_chat(STORAGE_CHANNEL_ID)
+        if chat.pinned_message:
+            text = chat.pinned_message.text
+            if text and text.startswith("INVOICE_DATA\n"):
+                return json.loads(text[13:])
+    except Exception as e:
+        logger.error(f"Storage load error: {e}")
+    return {}
+
+
+async def storage_save_all(app, invoices):
+    """Save all invoices to channel as pinned message"""
+    try:
+        chat = await app.bot.get_chat(STORAGE_CHANNEL_ID)
+        text = f"INVOICE_DATA\n{json.dumps(invoices, ensure_ascii=False)}"
+
+        if chat.pinned_message:
+            # Edit existing pinned message
+            try:
+                await app.bot.edit_message_text(
+                    text, STORAGE_CHANNEL_ID, chat.pinned_message.message_id
+                )
+                return
+            except:
+                pass
+
+        # Send new message and pin it
+        msg = await app.bot.send_message(STORAGE_CHANNEL_ID, text)
+        await app.bot.pin_chat_message(STORAGE_CHANNEL_ID, msg.message_id)
+
+    except Exception as e:
+        logger.error(f"Storage save error: {e}")
+
+
+# ── EXCEL ─────────────────────────────────────────────────
+
+def create_excel(products, invoice_name):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Items"
@@ -99,7 +173,7 @@ def create_excel(products):
                     "Categories": p.get("category", ""), "Reporting Category": None, "GTIN": None,
                     "Item Type": "Physical good", "Weight (lb)": None,
                     "Social Media Link Title": None, "Social Media Link Description": None,
-                    "Price": p["sale_price"], "Online Sale Price": None, "Archived": "N",
+                    "Price": p.get("sale_price", 0), "Online Sale Price": None, "Archived": "N",
                     "Sellable": None, "Contains Alcohol": "N", "Stockable": None,
                     "Skip Detail Screen in POS": "N", "Option Name 1": None, "Option Value 1": None,
                     "Default Unit Cost": p["cost"], "Default Vendor Name": p.get("vendor", ""),
@@ -121,24 +195,25 @@ def create_excel(products):
     return buffer
 
 
-def build_final_summary(products):
-    lines = ["✅ *Excel hazır! İşte özet:*\n"]
+def build_summary(products, invoice_name):
+    lines = [f"✅ *{invoice_name} — Excel hazır!*\n"]
     total_units = 0
     for p in products:
-        lines.append(f"📦 *{p['name']}* (SKU: {p['sku']})")
+        lines.append(f"📦 *{p['sku']} - {p['name']}*")
         for color_name, color_info in p["colors"].items():
             qty = color_info["packs"] * p["units_per_size"]
             for size in p["sizes"]:
                 sku_var = f"{p['sku']}-{color_info['code']}-{size}"
-                lines.append(f"  • {color_name} / {size} → {sku_var} | Qty: {qty} | ${p['sale_price']}")
+                lines.append(f"  • {color_name}/{size} → {sku_var} | Qty:{qty} | ${p.get('sale_price', 0)}")
                 total_units += qty
         lines.append("")
     lines.append(f"📊 *Toplam: {total_units} adet*")
     return "\n".join(lines)
 
 
+# ── INVOICE PARSING ───────────────────────────────────────
+
 async def parse_invoice_image(image_bytes, media_type="image/jpeg"):
-    """Parse invoice using Claude Vision"""
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -155,284 +230,379 @@ async def parse_invoice_image(image_bytes, media_type="image/jpeg"):
 
 
 async def parse_invoice_pdf(pdf_bytes):
-    """Parse PDF invoice - convert first page to image then use Vision"""
-    import fitz  # PyMuPDF
+    import fitz
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
-    mat = fitz.Matrix(2, 2)  # 2x zoom for better quality
+    mat = fitz.Matrix(2, 2)
     pix = page.get_pixmap(matrix=mat)
     img_bytes = pix.tobytes("jpeg")
     doc.close()
     return await parse_invoice_image(img_bytes, "image/jpeg")
 
 
-async def ask_next_product(update, session):
-    """Ask color/size info for the next pending product"""
-    pending = session["pending_products"]
-    if not pending:
-        return False
-
-    product = pending[0]
-    await update.message.reply_text(
-        f"📦 *{product['sku']} - {product['name']}*\n"
-        f"Maliyet: ${product['cost']} | Adet: {product['qty']}\n\n"
-        f"Renk ve beden dağılımı?\n"
-        f"_(örn: 2S 2M 2L | 3 Black 3 White)_",
-        parse_mode="Markdown"
-    )
-    session["state"] = "asking_colors"
-    return True
-
+# ── COMMANDS ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_sessions[user_id] = {"state": "idle", "pending_products": [], "completed_products": []}
+    user_session.update({"state": "idle", "active_invoice": None, "current_sku": None})
     await update.message.reply_text(
         "👋 Merhaba! Ben Square POS Envanter Asistanınım.\n\n"
-        "📄 *Invoice'u gönder* (PDF veya fotoğraf)\n"
-        "Ben otomatik okuyup ürünleri çıkaracağım.\n"
-        "Sonra her ürün için sadece renk ve beden soracağım!\n\n"
-        "Ya da direkt ürün bilgisi de yazabilirsin:\n"
-        "`SKU | Ürün İsmi | Kategori | Adet | Beden | Renkler | Maliyet | Satış | Vendor`",
+        "📄 *Invoice yükle:* PDF veya fotoğraf gönder\n"
+        "📋 *Bekleyen invoice'lar:* /invoices\n"
+        "📦 *Koli teslim aldında:* `/teslim [isim]`\n"
+        "✅ *Tüm kutular bitti:* /done\n"
+        "⏭️ *Ürün atla:* `/skip SKU`",
         parse_mode="Markdown"
     )
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle PDF invoices"""
-    user_id = update.effective_user.id
-    doc = update.message.document
+async def cmd_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    invoices = await storage_load_all(context.application)
+    if not invoices:
+        await update.message.reply_text("📭 Henüz kayıtlı invoice yok.")
+        return
 
-    if not doc.mime_type == "application/pdf":
+    lines = ["📋 *Kayıtlı Invoice'lar:*\n"]
+    for name, inv in invoices.items():
+        total = len(inv["products"])
+        done = sum(1 for p in inv["products"] if p.get("completed"))
+        remaining = total - done
+        active = " ← AKTİF" if user_session.get("active_invoice") == name else ""
+        lines.append(f"• *{name}*{active}")
+        lines.append(f"  {done}/{total} tamamlandı, {remaining} bekliyor\n")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_teslim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Kullanım: `/teslim vava mart`", parse_mode="Markdown")
+        return
+
+    invoice_name = " ".join(context.args).lower().strip()
+    invoices = await storage_load_all(context.application)
+
+    if invoice_name not in invoices:
+        if invoices:
+            names = "\n".join(f"• {n}" for n in invoices.keys())
+            await update.message.reply_text(
+                f"❌ *{invoice_name}* bulunamadı.\n\nMevcut invoice'lar:\n{names}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text("❌ Kayıtlı invoice yok. Önce PDF yükle.")
+        return
+
+    user_session["active_invoice"] = invoice_name
+    user_session["state"] = "receiving_products"
+
+    inv = invoices[invoice_name]
+    remaining = [p for p in inv["products"] if not p.get("completed")]
+    done_count = len(inv["products"]) - len(remaining)
+
+    lines = [f"✅ *{invoice_name}* aktif!\n"]
+    lines.append(f"📦 {len(remaining)} ürün bekliyor, {done_count} tamamlandı\n")
+    lines.append("*Bekleyen ürünler:*")
+    for p in remaining:
+        lines.append(f"• {p['sku']} - {p['name']} (${p['cost']})")
+    lines.append("\n*Format:* `SKU renk/adet beden`")
+    lines.append("_Örn: 1308 3siyah 3beyaz 2S2M2L_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    invoice_name = user_session.get("active_invoice")
+    if not invoice_name:
+        await update.message.reply_text("❌ Aktif invoice yok. `/teslim [isim]` yaz.", parse_mode="Markdown")
+        return
+
+    invoices = await storage_load_all(context.application)
+    inv = invoices.get(invoice_name, {})
+    completed = [p for p in inv.get("products", []) if p.get("completed")]
+    remaining = [p for p in inv.get("products", []) if not p.get("completed")]
+
+    if not completed:
+        await update.message.reply_text("❌ Henüz hiç ürün girilmedi.")
+        return
+
+    if remaining:
+        names = ", ".join(p["sku"] for p in remaining)
+        await update.message.reply_text(
+            f"⚠️ {len(remaining)} ürün girilmedi: *{names}*\n\n"
+            f"Yine de Excel oluşturmak için: /done\_force",
+            parse_mode="Markdown"
+        )
+        return
+
+    await generate_excel(update, context, invoice_name, completed, invoices)
+
+
+async def cmd_done_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    invoice_name = user_session.get("active_invoice")
+    if not invoice_name:
+        await update.message.reply_text("❌ Aktif invoice yok.")
+        return
+
+    invoices = await storage_load_all(context.application)
+    inv = invoices.get(invoice_name, {})
+    completed = [p for p in inv.get("products", []) if p.get("completed")]
+
+    if not completed:
+        await update.message.reply_text("❌ Hiç ürün girilmedi.")
+        return
+
+    await generate_excel(update, context, invoice_name, completed, invoices)
+
+
+async def generate_excel(update, context, invoice_name, completed, invoices):
+    await update.message.reply_text("⏳ Excel hazırlanıyor...")
+    excel_buffer = create_excel(completed, invoice_name)
+    summary = build_summary(completed, invoice_name)
+    await update.message.reply_text(summary, parse_mode="Markdown")
+
+    safe_name = invoice_name.replace(" ", "_")
+    filename = f"{safe_name}_square_catalog.xlsx"
+    await update.message.reply_document(
+        document=excel_buffer,
+        filename=filename,
+        caption=f"📎 `{filename}`",
+        parse_mode="Markdown"
+    )
+
+    # Archive
+    del invoices[invoice_name]
+    await storage_save_all(context.application, invoices)
+    user_session.update({"active_invoice": None, "state": "idle", "current_sku": None})
+
+
+async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Kullanım: `/skip 1308`", parse_mode="Markdown")
+        return
+
+    invoice_name = user_session.get("active_invoice")
+    if not invoice_name:
+        await update.message.reply_text("❌ Aktif invoice yok.")
+        return
+
+    sku = context.args[0].upper()
+    invoices = await storage_load_all(context.application)
+    inv = invoices.get(invoice_name, {})
+
+    for p in inv["products"]:
+        if p["sku"].upper() == sku:
+            p["completed"] = True
+            p["skipped"] = True
+            await storage_save_all(context.application, invoices)
+            remaining = sum(1 for x in inv["products"] if not x.get("completed"))
+            await update.message.reply_text(
+                f"⏭️ *{sku}* atlandı. {remaining} ürün kaldı.",
+                parse_mode="Markdown"
+            )
+            return
+
+    await update.message.reply_text(f"❌ {sku} bulunamadı.")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_session.update({"state": "idle", "active_invoice": None, "current_sku": None})
+    await update.message.reply_text("🔄 Sıfırlandı!")
+
+
+# ── FILE HANDLERS ─────────────────────────────────────────
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
         await update.message.reply_text("❌ Sadece PDF veya fotoğraf kabul ediyorum.")
         return
 
     await update.message.reply_text("📄 Invoice okunuyor...")
-
     try:
         file = await context.bot.get_file(doc.file_id)
         pdf_bytes = await file.download_as_bytearray()
         result = await parse_invoice_pdf(bytes(pdf_bytes))
-        await process_invoice_result(update, user_id, result)
+        await process_invoice_result(update, context, result)
     except Exception as e:
         logger.error(f"PDF error: {e}")
         await update.message.reply_text(f"❌ PDF okunamadı: {str(e)}")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo invoices"""
-    user_id = update.effective_user.id
-    await update.message.reply_text("📸 Invoice fotoğrafı okunuyor...")
-
+    await update.message.reply_text("📸 Invoice okunuyor...")
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         img_bytes = await file.download_as_bytearray()
         result = await parse_invoice_image(bytes(img_bytes))
-        await process_invoice_result(update, user_id, result)
+        await process_invoice_result(update, context, result)
     except Exception as e:
         logger.error(f"Photo error: {e}")
         await update.message.reply_text(f"❌ Fotoğraf okunamadı: {str(e)}")
 
 
-async def process_invoice_result(update, user_id, result):
-    """Process parsed invoice JSON and start asking questions"""
+async def process_invoice_result(update, context, result):
     try:
         json_match = re.search(r'\[[\s\S]*\]', result)
         if not json_match:
-            await update.message.reply_text(
-                "❌ Invoice okunamadı. Lütfen daha net bir fotoğraf deneyin."
-            )
+            await update.message.reply_text("❌ Invoice okunamadı. Daha net bir görüntü deneyin.")
             return
 
         products = json.loads(json_match.group())
+        for p in products:
+            p["completed"] = False
 
-        if user_id not in user_sessions:
-            user_sessions[user_id] = {"state": "idle", "pending_products": [], "completed_products": []}
-
-        session = user_sessions[user_id]
-        session["pending_products"] = products
-        session["completed_products"] = []
-
-        # Show what was detected
         lines = [f"✅ *{len(products)} ürün tespit edildi:*\n"]
         for p in products:
-            lines.append(f"• {p['sku']} - {p['name']} | Adet: {p['qty']} | Maliyet: ${p['cost']}")
-        lines.append("\nŞimdi sırayla renk ve beden bilgilerini soracağım...")
+            lines.append(f"• {p['sku']} - {p['name']} | Adet: {p['qty']} | ${p['cost']}")
+        lines.append("\n*Bu invoice'a bir isim ver:*\n_(örn: vava mart, supplier abc)_")
+
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-        # Ask for first product
-        await ask_next_product(update, session)
+        user_session["state"] = "waiting_invoice_name"
+        user_session["pending_products"] = products
 
     except Exception as e:
         logger.error(f"Invoice processing error: {e}")
         await update.message.reply_text("❌ Invoice işlenirken hata oluştu.")
 
 
+# ── MESSAGE HANDLER ───────────────────────────────────────
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     user_message = update.message.text.strip()
+    state = user_session.get("state", "idle")
 
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {"state": "idle", "pending_products": [], "completed_products": []}
+    # Waiting for invoice name
+    if state == "waiting_invoice_name":
+        invoice_name = user_message.lower().strip()
+        invoices = await storage_load_all(context.application)
 
-    session = user_sessions[user_id]
-    state = session.get("state", "idle")
+        if invoice_name in invoices:
+            await update.message.reply_text(f"⚠️ *{invoice_name}* zaten var. Farklı bir isim yaz.", parse_mode="Markdown")
+            return
 
-    # Asking for color/size info
-    if state == "asking_colors":
-        current_product = session["pending_products"][0]
+        products = user_session.get("pending_products", [])
+        invoices[invoice_name] = {"products": products}
+        await storage_save_all(context.application, invoices)
+
+        user_session["state"] = "idle"
+        user_session["pending_products"] = []
+
+        await update.message.reply_text(
+            f"✅ *{invoice_name}* kaydedildi! {len(products)} ürün bekleniyor.\n\n"
+            f"Koli geldiğinde:\n`/teslim {invoice_name}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Receiving products
+    if state == "receiving_products":
+        invoice_name = user_session.get("active_invoice")
+        if not invoice_name:
+            await update.message.reply_text("❌ Aktif invoice yok.", parse_mode="Markdown")
+            return
+
+        invoices = await storage_load_all(context.application)
+        inv = invoices.get(invoice_name, {})
+
+        parts = user_message.split()
+        if not parts:
+            return
+
+        sku = parts[0].upper()
+        rest = " ".join(parts[1:])
+
+        product = next((p for p in inv["products"] if p["sku"].upper() == sku), None)
+
+        if not product:
+            await update.message.reply_text(
+                f"❌ *{sku}* bu invoice'da bulunamadı.\n`/invoices` ile listeye bak.",
+                parse_mode="Markdown"
+            )
+            return
+
+        if product.get("completed"):
+            await update.message.reply_text(f"⚠️ *{sku}* zaten girilmiş.", parse_mode="Markdown")
+            return
+
         try:
             response = client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=500,
-                system=CATALOG_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}]
+                system=COLOR_PARSE_PROMPT,
+                messages=[{"role": "user", "content": rest}]
             )
             parsed = json.loads(response.content[0].text.strip())
-            current_product["colors"] = parsed["colors"]
-            current_product["sizes"] = parsed["sizes"]
-            current_product["units_per_size"] = parsed["units_per_size"]
-            session["state"] = "asking_price"
+            product["colors"] = parsed["colors"]
+            product["sizes"] = parsed["sizes"]
+            product["units_per_size"] = parsed["units_per_size"]
+
+            user_session["state"] = "asking_price"
+            user_session["current_sku"] = sku
+            await storage_save_all(context.application, invoices)
+
             await update.message.reply_text(
-                f"💰 *{current_product['sku']} - {current_product['name']}*\n"
-                f"Satış fiyatı nedir?",
+                f"💰 *{sku} - {product['name']}*\nSatış fiyatı?",
                 parse_mode="Markdown"
             )
         except Exception as e:
             logger.error(f"Color parse error: {e}")
             await update.message.reply_text(
-                "❌ Anlayamadım. Tekrar dener misin?\n"
-                "_(örn: 2S 2M 2L | 3 Black 3 White)_",
+                "❌ Anlayamadım.\nFormat: `SKU renk/adet beden`\n_Örn: 1308 3siyah 3beyaz 2S2M2L_",
                 parse_mode="Markdown"
             )
+        return
 
-    # Asking for sale price
-    elif state == "asking_price":
-        current_product = session["pending_products"][0]
+    # Asking price
+    if state == "asking_price":
+        invoice_name = user_session.get("active_invoice")
+        sku = user_session.get("current_sku")
+        invoices = await storage_load_all(context.application)
+        inv = invoices.get(invoice_name, {})
+        product = next((p for p in inv["products"] if p["sku"].upper() == sku), None)
+
         try:
             price_match = re.search(r'[\d.]+', user_message)
             if not price_match:
-                await update.message.reply_text("❌ Geçerli bir fiyat gir. (örn: 24.99)")
+                await update.message.reply_text("❌ Geçerli fiyat gir. (örn: 24.99)")
                 return
 
-            current_product["sale_price"] = float(price_match.group())
-            current_product["category"] = "Items"
-            current_product["vendor"] = ""
+            product["sale_price"] = float(price_match.group())
+            product["completed"] = True
+            await storage_save_all(context.application, invoices)
 
-            # Move to completed
-            session["completed_products"].append(current_product)
-            session["pending_products"].pop(0)
+            remaining = [p for p in inv["products"] if not p.get("completed")]
+            user_session["state"] = "receiving_products"
+            user_session["current_sku"] = None
 
-            await update.message.reply_text(
-                f"✅ *{current_product['sku']} - {current_product['name']}* kaydedildi!",
-                parse_mode="Markdown"
-            )
-
-            # Check if more products
-            if session["pending_products"]:
-                await ask_next_product(update, session)
-            else:
-                # All done - generate Excel
-                session["state"] = "idle"
-                excel_buffer = create_excel(session["completed_products"])
-                summary = build_final_summary(session["completed_products"])
-                await update.message.reply_text(summary, parse_mode="Markdown")
-
-                first_sku = session["completed_products"][0]["sku"]
-                filename = f"{first_sku}_square_catalog.xlsx"
-                await update.message.reply_document(
-                    document=excel_buffer,
-                    filename=filename,
-                    caption=f"📎 Square import dosyan hazır: `{filename}`",
-                    parse_mode="Markdown"
-                )
-                session["completed_products"] = []
+            msg = f"✅ *{sku}* kaydedildi! *{len(remaining)} ürün kaldı.*"
+            if not remaining:
+                msg += "\n\n🎉 Tüm ürünler bitti! /done yaz."
+            await update.message.reply_text(msg, parse_mode="Markdown")
 
         except Exception as e:
             logger.error(f"Price error: {e}")
-            await update.message.reply_text("❌ Fiyat anlaşılamadı. Tekrar dene. (örn: 24.99)")
-
-    # Idle state - handle manual product entry
-    else:
-        # Check if it's manual pipe-separated format
-        if "|" in user_message:
-            await update.message.reply_text("⏳ İşleniyor...")
-            try:
-                response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=4000,
-                    system="""Parse pipe-separated product data and return ONLY a JSON array:
-[{"model":"1450","product_name":"Floral Midi Dress","category":"Dresses","vendor":"Co.","price":19.90,"cost":6.00,"colors":{"BLACK":{"code":"BLK","packs":5}},"sizes":["S","M","L"],"units_per_size":2}]
-Color codes: BLACK=BLK, WHITE=WHT, BLUE=BLU, BEIGE=BGE, PINK=PNK, RED=RED, GREEN=GRN, GREY=GRY, BROWN=BRN""",
-                    messages=[{"role": "user", "content": user_message}]
-                )
-                assistant_message = response.content[0].text.strip()
-                json_match = re.search(r'\[[\s\S]*\]', assistant_message)
-                if json_match:
-                    products_data = json.loads(json_match.group())
-                    # Convert to invoice-style format
-                    converted = []
-                    for p in products_data:
-                        converted.append({
-                            "sku": p["model"], "name": p["product_name"],
-                            "qty": sum(v["packs"] for v in p["colors"].values()) * p["units_per_size"] * len(p["sizes"]),
-                            "cost": p["cost"], "sale_price": p["price"],
-                            "category": p["category"], "vendor": p["vendor"],
-                            "colors": p["colors"], "sizes": p["sizes"],
-                            "units_per_size": p["units_per_size"]
-                        })
-                    excel_buffer = create_excel(converted)
-                    summary = build_final_summary(converted)
-                    await update.message.reply_text(summary, parse_mode="Markdown")
-                    filename = f"{converted[0]['sku']}_square_catalog.xlsx"
-                    await update.message.reply_document(
-                        document=excel_buffer,
-                        filename=filename,
-                        caption=f"📎 Square import dosyan hazır: `{filename}`",
-                        parse_mode="Markdown"
-                    )
-                else:
-                    await update.message.reply_text(assistant_message)
-            except Exception as e:
-                logger.error(f"Manual entry error: {e}")
-                await update.message.reply_text("❌ Bir hata oluştu. Tekrar dene.")
-        else:
-            await update.message.reply_text(
-                "📄 Invoice göndermek için PDF veya fotoğraf yükle.\n\n"
-                "Ya da manuel giriş için:\n"
-                "`SKU | Ürün | Kategori | Adet | Beden | Renkler | Maliyet | Satış | Vendor`",
-                parse_mode="Markdown"
-            )
-
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_sessions[user_id] = {"state": "idle", "pending_products": [], "completed_products": []}
-    await update.message.reply_text("🔄 Sıfırlandı!")
-
-
-async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Skip current product"""
-    user_id = update.effective_user.id
-    if user_id not in user_sessions:
+            await update.message.reply_text("❌ Fiyat anlaşılamadı.")
         return
-    session = user_sessions[user_id]
-    if session["pending_products"]:
-        skipped = session["pending_products"].pop(0)
-        await update.message.reply_text(f"⏭️ *{skipped['sku']} - {skipped['name']}* atlandı.", parse_mode="Markdown")
-        session["state"] = "idle"
-        if session["pending_products"]:
-            await ask_next_product(update, session)
-        else:
-            await update.message.reply_text("✅ Tüm ürünler işlendi.")
+
+    # Idle
+    await update.message.reply_text(
+        "📄 Invoice için PDF veya fotoğraf yükle.\n"
+        "📋 Mevcut invoice'lar için /invoices",
+        parse_mode="Markdown"
+    )
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("skip", skip))
+    app.add_handler(CommandHandler("invoices", cmd_invoices))
+    app.add_handler(CommandHandler("teslim", cmd_teslim))
+    app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("done_force", cmd_done_force))
+    app.add_handler(CommandHandler("skip", cmd_skip))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
