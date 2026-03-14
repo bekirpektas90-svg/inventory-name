@@ -14,35 +14,8 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
-DRIVE_FOLDER_ID = "1v7YJv9lxPblfrtIz3YBlIU4KkEZ31brT"
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# Google Drive setup - lazy import to avoid crash if not installed
-def get_drive_service():
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
-
-def upload_photo_to_drive(photo_bytes, filename):
-    try:
-        from googleapiclient.http import MediaIoBaseUpload
-        service = get_drive_service()
-        file_metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-        media = MediaIoBaseUpload(io.BytesIO(photo_bytes), mimetype="image/jpeg")
-        file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-        file_id = file.get("id")
-        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
-        return f"https://drive.google.com/uc?id={file_id}"
-    except Exception as e:
-        logger.error(f"Drive upload error: {e}")
-        return None
 
 SYSTEM_PROMPT = """You are an expert Inventory Management Assistant specialized in Square POS systems.
 
@@ -93,10 +66,9 @@ For general questions: respond naturally in the user's language.
 """
 
 conversation_history = {}
-pending_photos = {}
 
 
-def create_excel(products_data, photo_links=None):
+def create_excel(products_data):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Items"
@@ -109,7 +81,7 @@ def create_excel(products_data, photo_links=None):
         "Sellable", "Contains Alcohol", "Stockable", "Skip Detail Screen in POS",
         "Option Name 1", "Option Value 1", "Default Unit Cost", "Default Vendor Name",
         "Default Vendor Code", "Current Quantity GAVA NEW YORK", "New Quantity GAVA NEW YORK",
-        "Stock Alert Enabled GAVA NEW YORK", "Stock Alert Count GAVA NEW YORK", "Image URL"
+        "Stock Alert Enabled GAVA NEW YORK", "Stock Alert Count GAVA NEW YORK"
     ]
 
     ws.append(headers)
@@ -118,17 +90,12 @@ def create_excel(products_data, photo_links=None):
         cell.fill = PatternFill("solid", start_color="1F3864")
         cell.alignment = Alignment(horizontal="center")
 
-    photo_index = 0
     for p in products_data:
         description = f"{p['product_name']} — a stylish and comfortable everyday piece. Available in multiple colors and sizes."
         for color_name, color_info in p["colors"].items():
             color_code = color_info["code"]
             packs = color_info["packs"]
             qty_per_size = packs * p["units_per_size"]
-            image_url = None
-            if photo_links and photo_index < len(photo_links):
-                image_url = photo_links[photo_index]
-                photo_index += 1
             for size in p["sizes"]:
                 size_slug = size.lower().replace("/", "-")
                 handle = f"#{p['model']}-{p['product_name'].lower().replace(' ', '-')}-{color_name.lower()}-{size_slug}"
@@ -150,7 +117,6 @@ def create_excel(products_data, photo_links=None):
                     "New Quantity GAVA NEW YORK": qty_per_size,
                     "Stock Alert Enabled GAVA NEW YORK": None,
                     "Stock Alert Count GAVA NEW YORK": None,
-                    "Image URL": image_url,
                 }
                 ws.append([row.get(h) for h in headers])
 
@@ -164,7 +130,7 @@ def create_excel(products_data, photo_links=None):
     return buffer
 
 
-def build_summary(products_data, has_photos=False):
+def build_summary(products_data):
     lines = ["✅ *Excel hazır! İşte özet:*\n"]
     total = 0
     for p in products_data:
@@ -177,8 +143,6 @@ def build_summary(products_data, has_photos=False):
                 total += qty
         lines.append("")
     lines.append(f"📊 *Toplam: {total} adet*")
-    if has_photos:
-        lines.append("🖼️ *Fotoğraflar Google Drive'a yüklendi ve Excel'e eklendi!*")
     lines.append("\nYeni ürün eklemek ister misin?")
     return "\n".join(lines)
 
@@ -186,49 +150,15 @@ def build_summary(products_data, has_photos=False):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id] = []
-    pending_photos[user_id] = []
     await update.message.reply_text(
         "👋 Merhaba! Ben Square POS Envanter Asistanınım.\n\n"
-        "📸 *Fotoğraf göndermek istersen:*\n"
-        "Önce fotoğrafları gönder, sonra ürün bilgilerini yaz.\n\n"
         "📋 *Ürün bilgisi formatı:*\n"
         "`SKU | Ürün İsmi | Kategori | Toplam Adet | Beden Dağılımı | Renkler & Paketler | Maliyet | Satış Fiyatı | Vendor`\n\n"
         "Örnek:\n"
-        "`1450 | Floral Midi Dress | Dresses | 48 | 2S 2M 2L | 5 Black 3 White | 6$ | 19.90$ | Fashion Co.`",
+        "`1450 | Floral Midi Dress | Dresses | 48 | 2S 2M 2L | 5 Black 3 White | 6$ | 19.90$ | Fashion Co.`\n\n"
+        "Birden fazla ürün için her ürünü yeni satıra yaz.",
         parse_mode="Markdown"
     )
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in pending_photos:
-        pending_photos[user_id] = []
-
-    logger.info(f"Photo received from user {user_id}")
-    await update.message.reply_text("📸 Fotoğraf alındı, Google Drive'a yükleniyor...")
-
-    try:
-        photo = update.message.photo[-1]
-        photo_file = await context.bot.get_file(photo.file_id)
-        photo_bytes = await photo_file.download_as_bytearray()
-        filename = f"product_{photo.file_id}.jpg"
-        public_url = upload_photo_to_drive(bytes(photo_bytes), filename)
-
-        if public_url:
-            pending_photos[user_id].append(public_url)
-            count = len(pending_photos[user_id])
-            await update.message.reply_text(
-                f"✅ Fotoğraf {count} Drive'a yüklendi!\n"
-                f"Şimdi ürün bilgilerini gönderebilirsin."
-            )
-        else:
-            await update.message.reply_text(
-                "⚠️ Drive'a yüklenemedi ama devam edebilirsin.\n"
-                "Excel'de Image URL sütunu boş kalacak."
-            )
-    except Exception as e:
-        logger.error(f"Photo handler error: {e}")
-        await update.message.reply_text(f"❌ Fotoğraf işlenirken hata: {str(e)}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,8 +167,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id not in conversation_history:
         conversation_history[user_id] = []
-    if user_id not in pending_photos:
-        pending_photos[user_id] = []
 
     conversation_history[user_id].append({"role": "user", "content": user_message})
     await update.message.reply_text("⏳ İşleniyor...")
@@ -258,11 +186,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if json_match:
             try:
                 products_data = json.loads(json_match.group())
-                photo_links = pending_photos.get(user_id, [])
-                excel_buffer = create_excel(products_data, photo_links if photo_links else None)
-                has_photos = len(photo_links) > 0
-                summary = build_summary(products_data, has_photos)
-                pending_photos[user_id] = []
+                excel_buffer = create_excel(products_data)
+                summary = build_summary(products_data)
 
                 await update.message.reply_text(summary, parse_mode="Markdown")
                 first_product = products_data[0]["model"]
@@ -287,7 +212,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id] = []
-    pending_photos[user_id] = []
     await update.message.reply_text("🔄 Sıfırlandı! Yeni ürün bilgilerini gönderebilirsin.")
 
 
@@ -295,10 +219,9 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot starting...")
-    app.run_polling(allowed_updates=["message", "edited_message", "channel_post"])
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
