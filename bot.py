@@ -3,15 +3,11 @@ import re
 import io
 import json
 import logging
-import tempfile
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from anthropic import Anthropic
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,8 +19,10 @@ DRIVE_FOLDER_ID = "1v7YJv9lxPblfrtIz3YBlIU4KkEZ31brT"
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Google Drive setup
+# Google Drive setup - lazy import to avoid crash if not installed
 def get_drive_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
     creds_dict = json.loads(GOOGLE_CREDENTIALS)
     creds = service_account.Credentials.from_service_account_info(
         creds_dict,
@@ -33,31 +31,15 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 def upload_photo_to_drive(photo_bytes, filename):
-    """Upload photo to Google Drive and return public link"""
     try:
+        from googleapiclient.http import MediaIoBaseUpload
         service = get_drive_service()
-        file_metadata = {
-            "name": filename,
-            "parents": [DRIVE_FOLDER_ID]
-        }
+        file_metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
         media = MediaIoBaseUpload(io.BytesIO(photo_bytes), mimetype="image/jpeg")
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id"
-        ).execute()
-
+        file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
         file_id = file.get("id")
-
-        # Make file public
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "anyone", "role": "reader"}
-        ).execute()
-
-        # Return direct view link
-        public_link = f"https://drive.google.com/uc?id={file_id}"
-        return public_link
+        service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+        return f"https://drive.google.com/uc?id={file_id}"
     except Exception as e:
         logger.error(f"Drive upload error: {e}")
         return None
@@ -98,9 +80,8 @@ REQUIRED FIELDS: All 9 fields must be present. If any is missing, ask before pro
 CRITICAL RULE: When all data is valid, your ENTIRE response must be ONLY the JSON array.
 - Start your response with [
 - End your response with ]
-- No text before the [
-- No text after the ]
-- No explanations, no greetings, no markdown code blocks
+- No text before or after
+- No markdown code blocks
 
 Valid output example:
 [{"model":"1450","product_name":"Floral Midi Dress","category":"Dresses","vendor":"Fashion Co.","price":19.90,"cost":6.00,"colors":{"BLACK":{"code":"BLK","packs":5},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2}]
@@ -112,7 +93,7 @@ For general questions: respond naturally in the user's language.
 """
 
 conversation_history = {}
-pending_photos = {}  # user_id -> list of (filename, url)
+pending_photos = {}
 
 
 def create_excel(products_data, photo_links=None):
@@ -137,54 +118,33 @@ def create_excel(products_data, photo_links=None):
         cell.fill = PatternFill("solid", start_color="1F3864")
         cell.alignment = Alignment(horizontal="center")
 
-    rows = []
     photo_index = 0
-
     for p in products_data:
         description = f"{p['product_name']} — a stylish and comfortable everyday piece. Available in multiple colors and sizes."
         for color_name, color_info in p["colors"].items():
             color_code = color_info["code"]
             packs = color_info["packs"]
             qty_per_size = packs * p["units_per_size"]
-
-            # Get photo link for this color if available
             image_url = None
             if photo_links and photo_index < len(photo_links):
                 image_url = photo_links[photo_index]
                 photo_index += 1
-
             for size in p["sizes"]:
                 size_slug = size.lower().replace("/", "-")
                 handle = f"#{p['model']}-{p['product_name'].lower().replace(' ', '-')}-{color_name.lower()}-{size_slug}"
                 sku = f"{p['model']}-{color_code}-{size}"
                 variation = f"{p['product_name']} {color_name} / {size}"
-
                 row = {
-                    "Reference Handle": handle,
-                    "Token": None,
-                    "Item Name": p["product_name"],
-                    "Customer-facing Name": p["product_name"],
-                    "Variation Name": variation,
-                    "SKU": sku,
-                    "Description": description,
-                    "Categories": p["category"],
-                    "Reporting Category": None,
-                    "GTIN": None,
-                    "Item Type": "Physical good",
-                    "Weight (lb)": None,
-                    "Social Media Link Title": None,
-                    "Social Media Link Description": None,
-                    "Price": p["price"],
-                    "Online Sale Price": None,
-                    "Archived": "N",
-                    "Sellable": None,
-                    "Contains Alcohol": "N",
-                    "Stockable": None,
-                    "Skip Detail Screen in POS": "N",
-                    "Option Name 1": None,
-                    "Option Value 1": None,
-                    "Default Unit Cost": p["cost"],
-                    "Default Vendor Name": p["vendor"],
+                    "Reference Handle": handle, "Token": None,
+                    "Item Name": p["product_name"], "Customer-facing Name": p["product_name"],
+                    "Variation Name": variation, "SKU": sku, "Description": description,
+                    "Categories": p["category"], "Reporting Category": None, "GTIN": None,
+                    "Item Type": "Physical good", "Weight (lb)": None,
+                    "Social Media Link Title": None, "Social Media Link Description": None,
+                    "Price": p["price"], "Online Sale Price": None, "Archived": "N",
+                    "Sellable": None, "Contains Alcohol": "N", "Stockable": None,
+                    "Skip Detail Screen in POS": "N", "Option Name 1": None, "Option Value 1": None,
+                    "Default Unit Cost": p["cost"], "Default Vendor Name": p["vendor"],
                     "Default Vendor Code": None,
                     "Current Quantity GAVA NEW YORK": qty_per_size,
                     "New Quantity GAVA NEW YORK": qty_per_size,
@@ -192,10 +152,7 @@ def create_excel(products_data, photo_links=None):
                     "Stock Alert Count GAVA NEW YORK": None,
                     "Image URL": image_url,
                 }
-                rows.append(row)
-
-    for row_data in rows:
-        ws.append([row_data.get(h) for h in headers])
+                ws.append([row.get(h) for h in headers])
 
     for col in ws.columns:
         max_len = max((len(str(cell.value)) if cell.value else 0) for cell in col)
@@ -204,7 +161,7 @@ def create_excel(products_data, photo_links=None):
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
-    return buffer, rows
+    return buffer
 
 
 def build_summary(products_data, has_photos=False):
@@ -244,18 +201,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     if user_id not in pending_photos:
         pending_photos[user_id] = []
 
-    await update.message.reply_text("📸 Fotoğraf alındı, yükleniyor...")
+    logger.info(f"Photo received from user {user_id}")
+    await update.message.reply_text("📸 Fotoğraf alındı, Google Drive'a yükleniyor...")
 
     try:
-        # Get highest resolution photo
         photo = update.message.photo[-1]
         photo_file = await context.bot.get_file(photo.file_id)
         photo_bytes = await photo_file.download_as_bytearray()
-
         filename = f"product_{photo.file_id}.jpg"
         public_url = upload_photo_to_drive(bytes(photo_bytes), filename)
 
@@ -263,15 +218,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_photos[user_id].append(public_url)
             count = len(pending_photos[user_id])
             await update.message.reply_text(
-                f"✅ Fotoğraf {count} Google Drive'a yüklendi!\n"
+                f"✅ Fotoğraf {count} Drive'a yüklendi!\n"
                 f"Şimdi ürün bilgilerini gönderebilirsin."
             )
         else:
-            await update.message.reply_text("❌ Fotoğraf yüklenemedi. Tekrar dene.")
-
+            await update.message.reply_text(
+                "⚠️ Drive'a yüklenemedi ama devam edebilirsin.\n"
+                "Excel'de Image URL sütunu boş kalacak."
+            )
     except Exception as e:
-        logger.error(f"Photo error: {e}")
-        await update.message.reply_text("❌ Fotoğraf işlenirken hata oluştu.")
+        logger.error(f"Photo handler error: {e}")
+        await update.message.reply_text(f"❌ Fotoğraf işlenirken hata: {str(e)}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,7 +241,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_photos[user_id] = []
 
     conversation_history[user_id].append({"role": "user", "content": user_message})
-
     await update.message.reply_text("⏳ İşleniyor...")
 
     try:
@@ -303,15 +259,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 products_data = json.loads(json_match.group())
                 photo_links = pending_photos.get(user_id, [])
-                excel_buffer, rows = create_excel(products_data, photo_links if photo_links else None)
+                excel_buffer = create_excel(products_data, photo_links if photo_links else None)
                 has_photos = len(photo_links) > 0
                 summary = build_summary(products_data, has_photos)
-
-                # Clear photos after use
                 pending_photos[user_id] = []
 
                 await update.message.reply_text(summary, parse_mode="Markdown")
-
                 first_product = products_data[0]["model"]
                 filename = f"{first_product}_square_catalog.xlsx"
                 await update.message.reply_document(
