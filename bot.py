@@ -24,7 +24,7 @@ INVOICE_PROMPT = """You are an invoice parser. Extract all product lines from th
 For each product line extract:
 - SKU/Model number
 - Product name  
-- Quantity (total units or packs) 
+- Quantity (total units or packs)
 - Unit cost (Rate/Price per unit)
 
 Respond ONLY with a JSON array, no other text:
@@ -232,12 +232,24 @@ async def parse_invoice_image(image_bytes, media_type="image/jpeg"):
 async def parse_invoice_pdf(pdf_bytes):
     import fitz
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    mat = fitz.Matrix(2, 2)
-    pix = page.get_pixmap(matrix=mat)
-    img_bytes = pix.tobytes("jpeg")
+    all_products = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        mat = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("jpeg")
+        result = await parse_invoice_image(img_bytes, "image/jpeg")
+        json_match = re.search(r'\[[\s\S]*\]', result)
+        if json_match:
+            try:
+                products = json.loads(json_match.group())
+                all_products.extend(products)
+            except:
+                pass
+
     doc.close()
-    return await parse_invoice_image(img_bytes, "image/jpeg")
+    return json.dumps(all_products) if all_products else "[]"
 
 
 # ── COMMANDS ──────────────────────────────────────────────
