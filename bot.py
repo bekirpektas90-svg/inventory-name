@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-STORAGE_CHANNEL_ID = -1001003837623060
+STORAGE_CHANNEL_ID = -1003837623060
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -24,7 +24,7 @@ INVOICE_PROMPT = """You are an invoice parser. Extract all product lines from th
 For each product line extract:
 - SKU/Model number
 - Product name  
-- Quantity (total units or packs)
+- Quantity (total units or packs) 
 - Unit cost (Rate/Price per unit)
 
 Respond ONLY with a JSON array, no other text:
