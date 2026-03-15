@@ -19,8 +19,10 @@ STORAGE_GROUP_ID = -5237650194
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# In-memory: {invoice_name: message_id} — one msg per invoice in group
+# In-memory: {invoice_name: [message_ids]} — one or more msgs per invoice
 invoice_msg_ids = {}
+# Cache: {invoice_name: inv_data} — avoid re-reading from group every time
+invoice_cache = {}
 
 # In-memory session
 user_session = {"state": "idle", "active_invoice": None, "current_sku": None, "pending_products": []}
@@ -97,10 +99,15 @@ async def save_invoice(app, invoice_name, inv):
             logger.error(f"Save chunk error: {e}")
     
     invoice_msg_ids[invoice_name] = msg_ids
+    invoice_cache[invoice_name] = inv  # Update cache
     logger.info(f"Saved {invoice_name} in {len(msg_ids)} messages")
 
 async def load_invoice(app, invoice_name):
-    """Load one invoice from group by forwarding its messages"""
+    """Load invoice - use cache if available"""
+    global invoice_cache
+    if invoice_name in invoice_cache:
+        return invoice_cache[invoice_name]
+    
     if invoice_name not in invoice_msg_ids:
         return None
     
@@ -108,7 +115,6 @@ async def load_invoice(app, invoice_name):
     if not isinstance(msg_ids, list):
         msg_ids = [msg_ids]
     
-    # Collect all chunks
     chunks = {}
     for msg_id in msg_ids:
         try:
@@ -116,8 +122,7 @@ async def load_invoice(app, invoice_name):
             if fwd.text and fwd.text.startswith("INV|"):
                 parts = fwd.text.split("|", 3)
                 if len(parts) == 4:
-                    chunk_info = parts[2]  # e.g. "1/3"
-                    chunk_idx = int(chunk_info.split("/")[0]) - 1
+                    chunk_idx = int(parts[2].split("/")[0]) - 1
                     chunks[chunk_idx] = json.loads(parts[3])
             await app.bot.delete_message(STORAGE_GROUP_ID, fwd.message_id)
         except Exception as e:
@@ -126,12 +131,13 @@ async def load_invoice(app, invoice_name):
     if not chunks:
         return None
     
-    # Reassemble
     all_packed = []
     for i in sorted(chunks.keys()):
         all_packed.extend(chunks[i])
     
-    return {"products": unpack_products(all_packed)}
+    inv = {"products": unpack_products(all_packed)}
+    invoice_cache[invoice_name] = inv  # Cache it!
+    return inv
 
 async def load_all_invoices(app):
     """Load all invoices"""
@@ -144,7 +150,7 @@ async def load_all_invoices(app):
 
 async def delete_invoice(app, invoice_name):
     """Delete invoice messages from group"""
-    global invoice_msg_ids
+    global invoice_msg_ids, invoice_cache
     if invoice_name in invoice_msg_ids:
         msg_ids = invoice_msg_ids[invoice_name]
         if not isinstance(msg_ids, list):
@@ -155,6 +161,8 @@ async def delete_invoice(app, invoice_name):
             except:
                 pass
         del invoice_msg_ids[invoice_name]
+    if invoice_name in invoice_cache:
+        del invoice_cache[invoice_name]
 
 # ── EXCEL ─────────────────────────────────────────────────
 
