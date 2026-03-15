@@ -33,18 +33,20 @@ Respond ONLY with a JSON array:
 [{"sku":"1308","name":"Dress Embroidery","qty":12,"cost":8.00}]
 """
 
-COLOR_PARSE_PROMPT = """You parse clothing inventory entries. Extract colors, sizes and sale price.
+COLOR_PARSE_PROMPT = """You parse clothing inventory entries.
 
-OUTPUT: Respond with ONLY a JSON object. No explanation, no markdown, no code blocks.
+The user writes: SKU [color entries] [size distribution] [sale price]
 
-JSON format:
-{"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":24.99}
+MEANING:
+- "6 siyah" = 6 units of BLACK color total
+- "6 beyaz" = 6 units of WHITE color total  
+- "2S2M2L" = size distribution (2 Small, 2 Medium, 2 Large) — must add up to the color quantity
+- The number before each color = total units of that color
+- units_per_size = number before each size letter
 
-RULES:
-- sizes: extract size labels like S,M,L,XL,2XL,S/M,M/L
-- units_per_size: number before each size (e.g. "2S2M2L" = 2)
-- packs: number before each color
-- sale_price: last number in the input (e.g. "24.99" or "24" at the end). If no price found, use 0.
+OUTPUT: Respond with ONLY raw JSON, no markdown, no explanation.
+
+{"colors":{"BLACK":{"code":"BLK","units":6},"WHITE":{"code":"WHT","units":6}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":24.99}
 
 COLOR MAPPING:
 siyah/black=BLK, beyaz/white=WHT, mavi/blue=BLU, kirmizi/red=RED,
@@ -53,13 +55,15 @@ kahve/brown=BRN, turuncu/orange=ORG, mor/purple=PRP
 
 EXAMPLES:
 Input: "6 siyah 6 beyaz 2S2M2L 24.99"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":6},"WHITE":{"code":"WHT","packs":6}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":24.99}
+→ BLACK=6 units, WHITE=6 units, sizes=[S,M,L], units_per_size=2, price=24.99
+Output: {"colors":{"BLACK":{"code":"BLK","units":6},"WHITE":{"code":"WHT","units":6}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":24.99}
 
-Input: "3siyah 3beyaz 2S2M2L 19"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":19}
+Input: "12 siyah 12 beyaz 2S2M2L 19.99"
+→ BLACK=12, WHITE=12, sizes=[S,M,L], units_per_size=2, price=19.99
+Output: {"colors":{"BLACK":{"code":"BLK","units":12},"WHITE":{"code":"WHT","units":12}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":19.99}
 
-Input: "4 black 4 red 2S2M2L 15.50"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":4},"RED":{"code":"RED","packs":4}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":15.50}
+Input: "6 black 6 white 6 beige 2S2M2L 15.00"
+Output: {"colors":{"BLACK":{"code":"BLK","units":6},"WHITE":{"code":"WHT","units":6},"BEIGE":{"code":"BGE","units":6}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":15.00}
 """
 
 # ── STORAGE ───────────────────────────────────────────────
@@ -208,7 +212,11 @@ def create_excel(products, invoice_name):
     for p in products:
         description = f"{p['name']} — available in multiple colors and sizes."
         for color_name, color_info in p["colors"].items():
-            qty_per_size = color_info["packs"] * p["units_per_size"]
+            # Support both old "packs" and new "units" format
+            if "units" in color_info:
+                qty_per_size = color_info["units"] // len(p["sizes"]) if p["sizes"] else color_info["units"]
+            else:
+                qty_per_size = color_info["packs"] * p["units_per_size"]
             for size in p["sizes"]:
                 size_slug = size.lower().replace("/", "-")
                 handle = f"#{p['sku']}-{p['name'].lower().replace(' ','-')}-{color_name.lower()}-{size_slug}"
@@ -248,7 +256,10 @@ def build_summary(products, invoice_name):
     for p in products:
         lines.append(f"📦 *{p['sku']} - {p['name']}*")
         for color_name, color_info in p["colors"].items():
-            qty = color_info["packs"] * p["units_per_size"]
+            if "units" in color_info:
+                qty = color_info["units"] // len(p["sizes"]) if p["sizes"] else color_info["units"]
+            else:
+                qty = color_info["packs"] * p["units_per_size"]
             for size in p["sizes"]:
                 lines.append(f"  • {color_name}/{size} → {p['sku']}-{color_info['code']}-{size} | Qty:{qty} | ${p.get('sale_price',0)}")
                 total += qty
@@ -498,8 +509,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invoice yüklenemedi.")
             return
 
-        # Support multiple products per message (one per line)
-        lines = [l.strip() for l in user_message.strip().split("\n") if l.strip()]
+        # Support multiple products per message (one per line or space-separated)
+        # First try splitting by newline
+        raw_lines = user_message.strip().split("\n")
+        lines = []
+        for raw in raw_lines:
+            raw = raw.strip()
+            if not raw: continue
+            # If line contains multiple SKUs (no newline between them),
+            # split by SKU pattern: number/letters followed by colors
+            # Re-split if we detect multiple SKU patterns in one line
+            # A SKU is at start or after a price (number at end of previous entry)
+            # Split on pattern: (space)(word that looks like SKU)(space)(number)(color)
+            import re as _re
+            # Split line into sub-entries: each starting with a word followed by digits/colors
+            sub = _re.split(r'(?<=[\d])\s+(?=[A-Za-z0-9]{3,10}\s+\d)', raw)
+            lines.extend([s.strip() for s in sub if s.strip()])
         saved = []
         errors = []
 
@@ -534,6 +559,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 product["sizes"] = parsed["sizes"]
                 product["units_per_size"] = parsed["units_per_size"]
                 product["sale_price"] = parsed.get("sale_price", 0)
+
+                # Quantity validation
+                # Total = sum of all color units
+                total_qty = sum(c["units"] for c in parsed["colors"].values())
+                invoice_qty = product["qty"]
+
+                if total_qty != invoice_qty:
+                    errors.append(
+                        f"⚠️ *{sku}* — Invoice'da *{invoice_qty} adet* var, "
+                        f"girdiğin *{total_qty} adet*. Düzelt ve tekrar gönder."
+                    )
+                    continue
+
+                # Store colors with units (not packs)
                 product["completed"] = True
                 saved.append(sku)
             except Exception as e:
