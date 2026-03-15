@@ -48,16 +48,30 @@ Examples:
 
 async def storage_load(app):
     global storage_msg_id
-    if not storage_msg_id:
-        return {}
     try:
-        # Try to get the message by forwarding it to ourselves - use getChat workaround
-        # We'll use a webhook/update approach: send a temp message, read, delete
         chat = await app.bot.get_chat(STORAGE_GROUP_ID)
-        # Try pinned message first
         if chat.pinned_message and chat.pinned_message.text and chat.pinned_message.text.startswith("INVDATA:"):
             storage_msg_id = chat.pinned_message.message_id
-            return json.loads(chat.pinned_message.text[8:])
+            compressed = json.loads(chat.pinned_message.text[8:])
+            # Decompress: expand short keys back to full format
+            invoices = {}
+            for name, inv in compressed.items():
+                invoices[name] = {"products": []}
+                for p in inv["products"]:
+                    full = {
+                        "sku": p.get("s", p.get("sku", "")),
+                        "name": p.get("n", p.get("name", "")),
+                        "qty": p.get("q", p.get("qty", 0)),
+                        "cost": p.get("c", p.get("cost", 0)),
+                        "completed": p.get("done", p.get("completed", False)),
+                    }
+                    if p.get("col") or p.get("colors"): full["colors"] = p.get("col", p.get("colors"))
+                    if p.get("sz") or p.get("sizes"): full["sizes"] = p.get("sz", p.get("sizes"))
+                    if p.get("ups") or p.get("units_per_size"): full["units_per_size"] = p.get("ups", p.get("units_per_size"))
+                    if p.get("sp") or p.get("sale_price"): full["sale_price"] = p.get("sp", p.get("sale_price"))
+                    if p.get("skip"): full["skipped"] = True
+                    invoices[name]["products"].append(full)
+            return invoices
     except Exception as e:
         logger.error(f"Storage load error: {e}")
     return {}
@@ -65,7 +79,19 @@ async def storage_load(app):
 
 async def storage_save(app, invoices):
     global storage_msg_id
-    text = "INVDATA:" + json.dumps(invoices, ensure_ascii=False)
+    # Compress data to fit Telegram 4096 char limit
+    compressed = {}
+    for name, inv in invoices.items():
+        compressed[name] = {"products": []}
+        for p in inv["products"]:
+            small = {"s": p["sku"], "n": p["name"][:20], "q": p["qty"], "c": p["cost"], "done": p.get("completed", False)}
+            if p.get("colors"): small["col"] = p["colors"]
+            if p.get("sizes"): small["sz"] = p["sizes"]
+            if p.get("units_per_size"): small["ups"] = p["units_per_size"]
+            if p.get("sale_price"): small["sp"] = p["sale_price"]
+            if p.get("skipped"): small["skip"] = True
+            compressed[name]["products"].append(small)
+    text = "INVDATA:" + json.dumps(compressed, ensure_ascii=False, separators=(",", ":"))
     try:
         if storage_msg_id:
             try:
@@ -73,10 +99,8 @@ async def storage_save(app, invoices):
                 return
             except Exception:
                 pass
-        # Send new message
         msg = await app.bot.send_message(STORAGE_GROUP_ID, text)
         storage_msg_id = msg.message_id
-        # Try to pin it
         try:
             await app.bot.pin_chat_message(STORAGE_GROUP_ID, storage_msg_id, disable_notification=True)
         except Exception as e:
