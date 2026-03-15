@@ -33,43 +33,33 @@ Respond ONLY with a JSON array:
 [{"sku":"1308","name":"Dress Embroidery","qty":12,"cost":8.00}]
 """
 
-COLOR_PARSE_PROMPT = """You parse clothing inventory color and size information.
+COLOR_PARSE_PROMPT = """You parse clothing inventory entries. Extract colors, sizes and sale price.
 
-OUTPUT: Respond with ONLY a JSON object. No explanation, no markdown, no code blocks. Just raw JSON.
+OUTPUT: Respond with ONLY a JSON object. No explanation, no markdown, no code blocks.
 
 JSON format:
-{"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2}
+{"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":24.99}
 
 RULES:
-- sizes: extract size labels like S,M,L,XL,2XL,S/M,M/L etc
-- units_per_size: the number before each size label (e.g. "2S 2M 2L" = 2)
-- packs: the number before each color name
+- sizes: extract size labels like S,M,L,XL,2XL,S/M,M/L
+- units_per_size: number before each size (e.g. "2S2M2L" = 2)
+- packs: number before each color
+- sale_price: last number in the input (e.g. "24.99" or "24" at the end). If no price found, use 0.
 
-COLOR MAPPING (Turkish and English):
-siyah/black = BLK
-beyaz/white = WHT  
-mavi/blue = BLU
-kirmizi/red = RED
-bej/beige = BGE
-pembe/pink = PNK
-yesil/green = GRN
-gri/grey = GRY
-kahve/brown = BRN
-turuncu/orange = ORG
-mor/purple = PRP
+COLOR MAPPING:
+siyah/black=BLK, beyaz/white=WHT, mavi/blue=BLU, kirmizi/red=RED,
+bej/beige=BGE, pembe/pink=PNK, yesil/green=GRN, gri/grey=GRY,
+kahve/brown=BRN, turuncu/orange=ORG, mor/purple=PRP
 
 EXAMPLES:
-Input: "6 siyah 6 beyaz 2S2M2L"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":6},"WHITE":{"code":"WHT","packs":6}},"sizes":["S","M","L"],"units_per_size":2}
+Input: "6 siyah 6 beyaz 2S2M2L 24.99"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":6},"WHITE":{"code":"WHT","packs":6}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":24.99}
 
-Input: "3siyah 3beyaz 2S2M2L"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2}
+Input: "3siyah 3beyaz 2S2M2L 19"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":19}
 
-Input: "4 black 4 red 4 blue 2S2M2L"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":4},"RED":{"code":"RED","packs":4},"BLUE":{"code":"BLU","packs":4}},"sizes":["S","M","L"],"units_per_size":2}
-
-Input: "6 siyah 6 beyaz 3S3M3L"
-Output: {"colors":{"BLACK":{"code":"BLK","packs":6},"WHITE":{"code":"WHT","packs":6}},"sizes":["S","M","L"],"units_per_size":3}
+Input: "4 black 4 red 2S2M2L 15.50"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":4},"RED":{"code":"RED","packs":4}},"sizes":["S","M","L"],"units_per_size":2,"sale_price":15.50}
 """
 
 # ── STORAGE ───────────────────────────────────────────────
@@ -507,62 +497,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not inv:
             await update.message.reply_text("❌ Invoice yüklenemedi.")
             return
-        parts = user_message.split()
-        if not parts: return
-        sku = parts[0].upper()
-        rest = " ".join(parts[1:])
-        product = next((p for p in inv["products"] if p["sku"].upper() == sku), None)
-        if not product:
-            await update.message.reply_text(f"❌ *{sku}* bu invoice'da yok.\n`/invoices` ile listeye bak.", parse_mode="Markdown")
-            return
-        if product.get("completed"):
-            await update.message.reply_text(f"⚠️ *{sku}* zaten girilmiş.", parse_mode="Markdown")
-            return
-        try:
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514", max_tokens=500,
-                system=COLOR_PARSE_PROMPT,
-                messages=[{"role":"user","content":rest}]
-            )
-            parsed = json.loads(response.content[0].text.strip())
-            product["colors"] = parsed["colors"]
-            product["sizes"] = parsed["sizes"]
-            product["units_per_size"] = parsed["units_per_size"]
-            user_session["state"] = "asking_price"
-            user_session["current_sku"] = sku
-            await save_invoice(context.application, invoice_name, inv)
-            await update.message.reply_text(f"💰 *{sku} - {product['name']}*\nSatış fiyatı?", parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Color parse error: {e}")
-            await update.message.reply_text("❌ Anlayamadım.\nFormat: `SKU renk/adet beden`\n_Örn: 1308 3siyah 3beyaz 2S2M2L_", parse_mode="Markdown")
-        return
 
-    if state == "asking_price":
-        invoice_name = user_session.get("active_invoice")
-        sku = user_session.get("current_sku")
-        inv = await load_invoice(context.application, invoice_name)
-        if not inv:
-            await update.message.reply_text("❌ Invoice yüklenemedi.")
-            return
-        product = next((p for p in inv["products"] if p["sku"].upper() == sku), None)
-        try:
-            price_match = re.search(r'[\d.]+', user_message)
-            if not price_match:
-                await update.message.reply_text("❌ Geçerli fiyat gir. (örn: 24.99)")
-                return
-            product["sale_price"] = float(price_match.group())
-            product["completed"] = True
+        # Support multiple products per message (one per line)
+        lines = [l.strip() for l in user_message.strip().split("\n") if l.strip()]
+        saved = []
+        errors = []
+
+        for line in lines:
+            parts = line.split()
+            if not parts: continue
+            sku = parts[0].upper()
+            rest = " ".join(parts[1:])
+
+            product = next((p for p in inv["products"] if p["sku"].upper() == sku), None)
+            if not product:
+                errors.append(f"❌ *{sku}* bu invoice'da yok")
+                continue
+            if product.get("completed"):
+                errors.append(f"⚠️ *{sku}* zaten girilmiş")
+                continue
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-20250514", max_tokens=500,
+                    system=COLOR_PARSE_PROMPT,
+                    messages=[{"role":"user","content":rest}]
+                )
+                parsed = json.loads(response.content[0].text.strip())
+                product["colors"] = parsed["colors"]
+                product["sizes"] = parsed["sizes"]
+                product["units_per_size"] = parsed["units_per_size"]
+                product["sale_price"] = parsed.get("sale_price", 0)
+                product["completed"] = True
+                saved.append(sku)
+            except Exception as e:
+                logger.error(f"Parse error {sku}: {e}")
+                errors.append(f"❌ *{sku}* anlaşılamadı")
+
+        if saved:
             await save_invoice(context.application, invoice_name, inv)
-            remaining = [p for p in inv["products"] if not p.get("completed")]
-            user_session["state"] = "receiving_products"
-            user_session["current_sku"] = None
-            msg = f"✅ *{sku}* kaydedildi! *{len(remaining)} ürün kaldı.*"
-            if not remaining:
-                msg += "\n\n🎉 Tüm ürünler bitti! /done yaz."
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Price error: {e}")
-            await update.message.reply_text("❌ Fiyat anlaşılamadı.")
+
+        remaining = [p for p in inv["products"] if not p.get("completed")]
+        msg_lines = []
+        if saved:
+            msg_lines.append(f"✅ *{', '.join(saved)}* kaydedildi!")
+        if errors:
+            msg_lines.extend(errors)
+        msg_lines.append(f"\n📦 *{len(remaining)} ürün kaldı.*")
+        if not remaining:
+            msg_lines.append("\n🎉 Tüm ürünler bitti! /done yaz.")
+
+        await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
         return
 
     await update.message.reply_text(
