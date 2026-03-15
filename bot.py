@@ -33,13 +33,43 @@ Respond ONLY with a JSON array:
 [{"sku":"1308","name":"Dress Embroidery","qty":12,"cost":8.00}]
 """
 
-COLOR_PARSE_PROMPT = """Parse color, size and quantity from natural language.
-Respond ONLY with JSON:
-{"colors":{"BLACK":{"code":"BLK","packs":3}},"sizes":["S","M","L"],"units_per_size":2}
-Color codes: BLACK/siyah=BLK,WHITE/beyaz=WHT,BLUE/mavi=BLU,BEIGE/bej=BGE,PINK/pembe=PNK,RED/kirmizi=RED,GREEN/yesil=GRN,GREY/gri=GRY,BROWN/kahve=BRN,ORANGE/turuncu=ORG,PURPLE/mor=PRP
-Examples:
-"3siyah 3beyaz 2S2M2L" → BLACK=3,WHITE=3,sizes=[S,M,L],units=2
-"4black 4red 2S2M2L" → BLACK=4,RED=4,sizes=[S,M,L],units=2
+COLOR_PARSE_PROMPT = """You parse clothing inventory color and size information.
+
+OUTPUT: Respond with ONLY a JSON object. No explanation, no markdown, no code blocks. Just raw JSON.
+
+JSON format:
+{"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2}
+
+RULES:
+- sizes: extract size labels like S,M,L,XL,2XL,S/M,M/L etc
+- units_per_size: the number before each size label (e.g. "2S 2M 2L" = 2)
+- packs: the number before each color name
+
+COLOR MAPPING (Turkish and English):
+siyah/black = BLK
+beyaz/white = WHT  
+mavi/blue = BLU
+kirmizi/red = RED
+bej/beige = BGE
+pembe/pink = PNK
+yesil/green = GRN
+gri/grey = GRY
+kahve/brown = BRN
+turuncu/orange = ORG
+mor/purple = PRP
+
+EXAMPLES:
+Input: "6 siyah 6 beyaz 2S2M2L"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":6},"WHITE":{"code":"WHT","packs":6}},"sizes":["S","M","L"],"units_per_size":2}
+
+Input: "3siyah 3beyaz 2S2M2L"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":3},"WHITE":{"code":"WHT","packs":3}},"sizes":["S","M","L"],"units_per_size":2}
+
+Input: "4 black 4 red 4 blue 2S2M2L"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":4},"RED":{"code":"RED","packs":4},"BLUE":{"code":"BLU","packs":4}},"sizes":["S","M","L"],"units_per_size":2}
+
+Input: "6 siyah 6 beyaz 3S3M3L"
+Output: {"colors":{"BLACK":{"code":"BLK","packs":6},"WHITE":{"code":"WHT","packs":6}},"sizes":["S","M","L"],"units_per_size":3}
 """
 
 # ── STORAGE ───────────────────────────────────────────────
