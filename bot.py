@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-STORAGE_GROUP_ID = -1003837623060
+STORAGE_GROUP_ID = -5237650194
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
