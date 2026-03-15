@@ -522,7 +522,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     system=COLOR_PARSE_PROMPT,
                     messages=[{"role":"user","content":rest}]
                 )
-                parsed = json.loads(response.content[0].text.strip())
+                raw = response.content[0].text.strip()
+                # Extract JSON even if Claude adds extra text
+                json_match = re.search(r'\{[\s\S]*\}', raw)
+                if not json_match:
+                    errors.append(f"❌ *{sku}* parse edilemedi")
+                    logger.error(f"No JSON in response for {sku}: {raw}")
+                    continue
+                parsed = json.loads(json_match.group())
                 product["colors"] = parsed["colors"]
                 product["sizes"] = parsed["sizes"]
                 product["units_per_size"] = parsed["units_per_size"]
@@ -531,10 +538,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 saved.append(sku)
             except Exception as e:
                 logger.error(f"Parse error {sku}: {e}")
-                errors.append(f"❌ *{sku}* anlaşılamadı")
+                errors.append(f"❌ *{sku}* anlaşılamadı: {str(e)[:50]}")
 
         if saved:
-            await save_invoice(context.application, invoice_name, inv)
+            # Update cache immediately - group save happens in background
+            invoice_cache[invoice_name] = inv
+            # Save to group (don't await - let it run)
+            import asyncio
+            asyncio.create_task(save_invoice(context.application, invoice_name, inv))
 
         remaining = [p for p in inv["products"] if not p.get("completed")]
         msg_lines = []
